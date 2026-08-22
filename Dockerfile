@@ -15,7 +15,7 @@ RUN mkdir -p gfpgan/weights && \
     curl -L -o gfpgan/weights/alignment_WFLW_4HG.pth \
     https://github.com/xinntao/facexlib/releases/download/v0.1.0/alignment_WFLW_4HG.pth
 
-RUN pip install --no-cache-dir coqui-tts
+RUN pip install --no-cache-dir "coqui-tts==0.25.2"
 ENV COQUI_TOS_AGREED=1
 RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
 
