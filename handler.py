@@ -4,7 +4,51 @@ import subprocess
 import os
 import uuid
 import shutil
-import traceback
+
+from TTS.api import TTS
+
+print("Загружаю модель XTTS-v2...")
+tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+print("XTTS-v2 готова.")
+
+EMOTION_PRESETS = {
+    "neutral": {"expression_scale": 0.7, "pose_style": 0, "still": True},
+    "happy":   {"expression_scale": 1.1, "pose_style": 0, "still": False},
+    "sadness": {"expression_scale": 0.6, "pose_style": 0, "still": True},
+    "anger":   {"expression_scale": 1.0, "pose_style": 0, "still": False},
+    "love":    {"expression_scale": 0.9, "pose_style": 0, "still": False},
+}
+
+
+def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
+                   pose_style, size, still, enhancer):
+    cmd = [
+        "python", "/app/SadTalker/inference.py",
+        "--driven_audio", audio_path,
+        "--source_image", image_path,
+        "--result_dir", result_dir,
+        "--size", str(size),
+        "--expression_scale", str(expression_scale),
+        "--pose_style", str(pose_style),
+    ]
+    if still:
+        cmd.append("--still")
+    if enhancer:
+        cmd += ["--enhancer", enhancer]
+
+    proc = subprocess.run(
+        cmd, cwd="/app/SadTalker",
+        capture_output=True, text=True, timeout=1800
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"SadTalker упал: {proc.stderr[-3000:]}")
+
+    for root, _, files in os.walk(result_dir):
+        for f in files:
+            if f.endswith(".mp4"):
+                return os.path.join(root, f)
+    raise RuntimeError("SadTalker не создал видео")
+
 
 def handler(event):
     input_data = event.get("input", {})
@@ -13,55 +57,54 @@ def handler(event):
     os.makedirs(work_dir, exist_ok=True)
 
     try:
-        if "image_base64" not in input_data or "audio_base64" not in input_data:
-            return {"error": "нужны image_base64 и audio_base64"}
+        if "image_base64" not in input_data:
+            return {"error": "нужен image_base64"}
 
         image_path = f"{work_dir}/source.jpg"
         with open(image_path, "wb") as f:
             f.write(base64.b64decode(input_data["image_base64"]))
 
-        audio_path = f"{work_dir}/driven.wav"
-        with open(audio_path, "wb") as f:
-            f.write(base64.b64decode(input_data["audio_base64"]))
+        if "audio_base64" in input_data:
+            audio_path = f"{work_dir}/driven.wav"
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(input_data["audio_base64"]))
+            expression_scale = input_data.get("expression_scale", 0.7)
+            pose_style = input_data.get("pose_style", 0)
+            still = input_data.get("still", True)
 
-        expression_scale = str(input_data.get("expression_scale", 0.7))
-        pose_style = str(input_data.get("pose_style", 0))
-        size = str(input_data.get("size", 512))
-        still = input_data.get("still", True)
+        elif "text" in input_data and "voice_sample_base64" in input_data:
+            voice_sample_path = f"{work_dir}/voice_sample.wav"
+            with open(voice_sample_path, "wb") as f:
+                f.write(base64.b64decode(input_data["voice_sample_base64"]))
+
+            text = input_data["text"]
+            language = input_data.get("language", "ru")
+            emotion = input_data.get("emotion", "neutral")
+            preset = EMOTION_PRESETS.get(emotion, EMOTION_PRESETS["neutral"])
+
+            audio_path = f"{work_dir}/synthesized.wav"
+            tts_model.tts_to_file(
+                text=text,
+                speaker_wav=voice_sample_path,
+                language=language,
+                file_path=audio_path,
+            )
+
+            expression_scale = preset["expression_scale"]
+            pose_style = preset["pose_style"]
+            still = preset["still"]
+
+        else:
+            return {"error": "нужны либо audio_base64, либо text + voice_sample_base64"}
+
+        size = input_data.get("size", 512)
         enhancer = input_data.get("enhancer", "gfpgan")
 
         result_dir = f"{work_dir}/results"
-
-        cmd = [
-            "python", "/app/SadTalker/inference.py",
-            "--driven_audio", audio_path,
-            "--source_image", image_path,
-            "--result_dir", result_dir,
-            "--size", size,
-            "--expression_scale", expression_scale,
-            "--pose_style", pose_style,
-        ]
-        if still:
-            cmd.append("--still")
-        if enhancer:
-            cmd += ["--enhancer", enhancer]
-
-        proc = subprocess.run(
-            cmd, cwd="/app/SadTalker",
-            capture_output=True, text=True, timeout=1800
+        video_path = run_sadtalker(
+            image_path, audio_path, result_dir,
+            expression_scale, pose_style, size, still, enhancer
         )
-
-        if proc.returncode != 0:
-            return {"error": "sadtalker failed", "stderr": proc.stderr[-3000:]}
-
-        video_path = None
-        for root, _, files in os.walk(result_dir):
-            for f in files:
-                if f.endswith(".mp4"):
-                    video_path = os.path.join(root, f)
-
-        if not video_path:
-            return {"error": "видео не сгенерировано", "stderr": proc.stderr[-3000:]}
 
         with open(video_path, "rb") as vf:
             video_base64 = base64.b64encode(vf.read()).decode("utf-8")
@@ -69,9 +112,11 @@ def handler(event):
         return {"video_base64": video_base64}
 
     except Exception as e:
+        import traceback
         return {"error": str(e), "trace": traceback.format_exc()[-2000:]}
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
 
 runpod.serverless.start({"handler": handler})
