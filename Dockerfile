@@ -6,9 +6,11 @@ RUN apt-get update && apt-get install -y ffmpeg libgl1 libglib2.0-0 curl espeak-
 RUN git clone https://github.com/OpenTalker/SadTalker.git
 WORKDIR /app/SadTalker
 
-RUN python3 -c "\
-import re, glob; \
-[open(f, 'w').write(re.sub(r'\\bnp\\.bool\\b', 'bool', re.sub(r'\\bnp\\.int\\b', 'int', re.sub(r'\\bnp\\.float\\b', 'float', open(f).read())))) for f in glob.glob('/app/SadTalker/**/*.py', recursive=True)]"
+RUN find /app/SadTalker -name "*.py" -exec sed -i \
+    -e 's/np\.float\b/float/g' \
+    -e 's/np\.int\b/int/g' \
+    -e 's/np\.bool\b/bool/g' \
+    {} +
 
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir "imageio>=2.31,<2.34" runpod
