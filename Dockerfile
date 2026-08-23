@@ -12,6 +12,10 @@ RUN find /app/SadTalker -name "*.py" -exec sed -i \
     -e 's/np\.bool\b/bool/g' \
     {} +
 
+RUN sed -i \
+    "s/trans_params = np\.array(\[w0, h0, s, t\[0\], t\[1\]\])/trans_params = np.array([float(w0), float(h0), float(s), float(t[0]), float(t[1])])/" \
+    /app/SadTalker/src/face3d/util/preprocess.py
+
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir "imageio>=2.31,<2.34" runpod
 
