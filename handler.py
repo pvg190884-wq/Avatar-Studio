@@ -115,6 +115,13 @@ EMOTION_PRESETS = {
     "love":    {"expression_scale": 0.9, "pose_style": 0, "still": False},
 }
 
+# Коэффициент приглушения expression_scale, применяется только когда
+# preprocess=full/extfull И still=False (то есть голове разрешено
+# двигаться). Подобран как стартовая точка — при необходимости можно
+# потюнить по факту тестов: меньше значение = меньше наклон/движение
+# головы, но и менее выразительная эмоция.
+FULL_PREPROCESS_DAMPING = 0.65
+
 
 def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
                    pose_style, size, still, enhancer, preprocess):
@@ -178,6 +185,14 @@ def handler(event):
             pose_style = input_data.get("pose_style", 0)
             still = input_data.get("still", True)
             preprocess = input_data.get("preprocess", "full")
+            # При preprocess=full/extfull сохраняем всё тело в кадре, но
+            # зона обратной вклейки (paste-back) плохо переносит резкий
+            # наклон/поворот головы — на границе шеи/плеч появляется шов.
+            # Вместо того чтобы полностью гасить движение головы (still=
+            # True), приглушаем его амплитуду через expression_scale —
+            # так голова остаётся "живой", просто менее размашисто.
+            if preprocess in ("full", "extfull") and not still:
+                expression_scale *= FULL_PREPROCESS_DAMPING
 
         elif "text" in input_data and "voice_sample_base64" in input_data:
             voice_sample_path = f"{work_dir}/voice_sample.wav"
@@ -213,6 +228,10 @@ def handler(event):
             pose_style = preset["pose_style"]
             still = preset["still"]
             preprocess = input_data.get("preprocess", "full")
+            # См. комментарий в ветке audio_base64 выше — та же причина
+            # и то же решение: приглушаем амплитуду, а не гасим движение.
+            if preprocess in ("full", "extfull") and not still:
+                expression_scale *= FULL_PREPROCESS_DAMPING
 
         else:
             return {"error": "нужны либо audio_base64, либо text + voice_sample_base64"}
