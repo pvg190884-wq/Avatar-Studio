@@ -2,6 +2,7 @@ import runpod
 import base64
 import subprocess
 import os
+import re
 import uuid
 import shutil
 
@@ -20,6 +21,90 @@ def get_tts_model():
         tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
         print("XTTS-v2 готова.")
     return tts_model
+
+
+# Параметры генерации XTTS-v2, подобранные под более живую, менее
+# "роботизированную" интонацию, чем дефолтные значения библиотеки.
+# temperature выше дефолтного (0.65) даёт больше естественной вариативности
+# высоты тона и темпа между фразами, не срываясь в нестабильность.
+# repetition_penalty повышен, чтобы избежать характерного "проглатывания"
+# слов на длинных фразах.
+TTS_GENERATION_PARAMS = {
+    "temperature": 0.75,
+    "repetition_penalty": 5.0,
+    "top_k": 50,
+    "top_p": 0.85,
+}
+
+# Длительность пауз между предложениями (мс), в зависимости от знака
+# препинания, которым предложение заканчивается — имитирует то, как
+# человек делает более долгую паузу после точки/восклицания, чем после
+# запятой внутри фразы.
+PAUSE_MS_BY_PUNCTUATION = {
+    ".": 450,
+    "!": 450,
+    "?": 500,
+    "...": 600,
+    ",": 200,
+}
+
+
+def split_into_sentences(text):
+    """Разбивает текст на предложения, сохраняя знак препинания в конце
+    каждого куска. Нужно для того, чтобы синтезировать TTS по фразам и
+    вставлять между ними естественные паузы, а не одним ровным потоком."""
+    # Разбиваем по границе предложения: точка/!/?/многоточие, за которыми
+    # следует пробел и заглавная буква (или конец строки).
+    parts = re.split(r'(?<=[.!?…])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def pause_after(sentence):
+    """Определяет длительность паузы после предложения по завершающему
+    знаку препинания."""
+    stripped = sentence.rstrip()
+    if stripped.endswith("..."):
+        return PAUSE_MS_BY_PUNCTUATION["..."]
+    if stripped.endswith("…"):
+        return PAUSE_MS_BY_PUNCTUATION["..."]
+    if stripped and stripped[-1] in PAUSE_MS_BY_PUNCTUATION:
+        return PAUSE_MS_BY_PUNCTUATION[stripped[-1]]
+    return PAUSE_MS_BY_PUNCTUATION["."]
+
+
+def synthesize_speech(text, speaker_wav_path, language, work_dir, speed=1.0):
+    """Синтезирует речь по предложениям с естественными паузами между
+    ними вместо одного монотонного потока. Возвращает путь к итоговому
+    .wav файлу."""
+    from pydub import AudioSegment
+
+    model = get_tts_model()
+    sentences = split_into_sentences(text)
+    if not sentences:
+        sentences = [text]
+
+    segments = []
+    for i, sentence in enumerate(sentences):
+        chunk_path = f"{work_dir}/chunk_{i}.wav"
+        model.tts_to_file(
+            text=sentence,
+            speaker_wav=speaker_wav_path,
+            language=language,
+            file_path=chunk_path,
+            speed=speed,
+            **TTS_GENERATION_PARAMS,
+        )
+        segments.append(AudioSegment.from_wav(chunk_path))
+        if i < len(sentences) - 1:
+            segments.append(AudioSegment.silent(duration=pause_after(sentence)))
+
+    combined = segments[0]
+    for seg in segments[1:]:
+        combined += seg
+
+    final_path = f"{work_dir}/synthesized.wav"
+    combined.export(final_path, format="wav")
+    return final_path
 
 
 EMOTION_PRESETS = {
@@ -115,12 +200,13 @@ def handler(event):
                 }
             preset = EMOTION_PRESETS[emotion]
 
-            audio_path = f"{work_dir}/synthesized.wav"
-            get_tts_model().tts_to_file(
+            speech_speed = input_data.get("speech_speed", 1.0)
+            audio_path = synthesize_speech(
                 text=text,
-                speaker_wav=voice_sample_path,
+                speaker_wav_path=voice_sample_path,
                 language=language,
-                file_path=audio_path,
+                work_dir=work_dir,
+                speed=speech_speed,
             )
 
             expression_scale = preset["expression_scale"]
