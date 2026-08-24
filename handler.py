@@ -5,11 +5,22 @@ import os
 import uuid
 import shutil
 
-from TTS.api import TTS
+# Ленивая загрузка XTTS-v2: модель НЕ грузится при старте контейнера/импорте
+# модуля (иначе холодный старт воркера может не успеть пройти проверку
+# готовности со стороны RunPod до того, как модель встанет на GPU).
+# Модель загружается один раз, при первом реальном запросе, требующем TTS.
+tts_model = None
 
-print("Загружаю модель XTTS-v2...")
-tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
-print("XTTS-v2 готова.")
+
+def get_tts_model():
+    global tts_model
+    if tts_model is None:
+        print("Загружаю модель XTTS-v2...")
+        from TTS.api import TTS
+        tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+        print("XTTS-v2 готова.")
+    return tts_model
+
 
 EMOTION_PRESETS = {
     "neutral": {"expression_scale": 0.7, "pose_style": 0, "still": True},
@@ -52,7 +63,16 @@ def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
 
 
 def handler(event):
-    input_data = event.get("input", {})
+    input_data = event.get("input", {}) or {}
+
+    # Мягкий healthcheck: RunPod может дёргать handler пустым/тестовым
+    # input на этапе проверки готовности воркера (Testing). Раньше такой
+    # вызов падал с "нужен image_base64", что могло восприниматься как
+    # сбой воркера. Теперь на явный healthcheck и на полностью пустой
+    # input отвечаем "ok", не трогая GPU/модели.
+    if input_data.get("healthcheck") is True or not input_data:
+        return {"ok": True}
+
     job_id = str(uuid.uuid4())
     work_dir = f"/tmp/{job_id}"
     os.makedirs(work_dir, exist_ok=True)
@@ -96,7 +116,7 @@ def handler(event):
             preset = EMOTION_PRESETS[emotion]
 
             audio_path = f"{work_dir}/synthesized.wav"
-            tts_model.tts_to_file(
+            get_tts_model().tts_to_file(
                 text=text,
                 speaker_wav=voice_sample_path,
                 language=language,
