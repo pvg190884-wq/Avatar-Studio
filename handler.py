@@ -14,8 +14,8 @@ print("XTTS-v2 готова.")
 EMOTION_PRESETS = {
     "neutral": {"expression_scale": 0.7, "pose_style": 0, "still": True},
     "happy":   {"expression_scale": 1.1, "pose_style": 0, "still": False},
-    "sadness": {"expression_scale": 0.6, "pose_style": 0, "still": True},
-    "anger":   {"expression_scale": 1.0, "pose_style": 0, "still": False},
+    "sad":     {"expression_scale": 0.6, "pose_style": 0, "still": True},
+    "angry":   {"expression_scale": 1.0, "pose_style": 0, "still": False},
     "love":    {"expression_scale": 0.9, "pose_style": 0, "still": False},
 }
 
@@ -80,7 +80,18 @@ def handler(event):
             text = input_data["text"]
             language = input_data.get("language", "ru")
             emotion = input_data.get("emotion", "neutral")
-            preset = EMOTION_PRESETS.get(emotion, EMOTION_PRESETS["neutral"])
+
+            # Явная проверка вместо тихого фолбэка на neutral —
+            # если пришло неизвестное имя эмоции, лучше сразу вернуть
+            # ошибку, чем незаметно сгенерировать не то, что просили.
+            if emotion not in EMOTION_PRESETS:
+                return {
+                    "error": (
+                        f"неизвестная эмоция '{emotion}', "
+                        f"доступны: {list(EMOTION_PRESETS.keys())}"
+                    )
+                }
+            preset = EMOTION_PRESETS[emotion]
 
             audio_path = f"{work_dir}/synthesized.wav"
             tts_model.tts_to_file(
