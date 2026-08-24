@@ -21,7 +21,7 @@ EMOTION_PRESETS = {
 
 
 def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
-                   pose_style, size, still, enhancer):
+                   pose_style, size, still, enhancer, preprocess):
     cmd = [
         "python", "/app/SadTalker/inference.py",
         "--driven_audio", audio_path,
@@ -30,6 +30,7 @@ def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
         "--size", str(size),
         "--expression_scale", str(expression_scale),
         "--pose_style", str(pose_style),
+        "--preprocess", preprocess,
     ]
     if still:
         cmd.append("--still")
@@ -71,6 +72,7 @@ def handler(event):
             expression_scale = input_data.get("expression_scale", 0.7)
             pose_style = input_data.get("pose_style", 0)
             still = input_data.get("still", True)
+            preprocess = input_data.get("preprocess", "full")
 
         elif "text" in input_data and "voice_sample_base64" in input_data:
             voice_sample_path = f"{work_dir}/voice_sample.wav"
@@ -104,6 +106,7 @@ def handler(event):
             expression_scale = preset["expression_scale"]
             pose_style = preset["pose_style"]
             still = preset["still"]
+            preprocess = input_data.get("preprocess", "full")
 
         else:
             return {"error": "нужны либо audio_base64, либо text + voice_sample_base64"}
@@ -114,7 +117,7 @@ def handler(event):
         result_dir = f"{work_dir}/results"
         video_path = run_sadtalker(
             image_path, audio_path, result_dir,
-            expression_scale, pose_style, size, still, enhancer
+            expression_scale, pose_style, size, still, enhancer, preprocess
         )
 
         with open(video_path, "rb") as vf:
