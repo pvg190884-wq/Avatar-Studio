@@ -107,6 +107,68 @@ def synthesize_speech(text, speaker_wav_path, language, work_dir, speed=1.0):
     return final_path
 
 
+# Пресеты обработки голоса — понижение/повышение тембра (через сдвиг
+# высоты тона) плюс лёгкая EQ-подкраска (бас/треble), по той же схеме,
+# что EMOTION_PRESETS ниже. Позже это станет выпадающим списком на сайте.
+#   pitch_semitones — сдвиг высоты тона в полутонах (± ~1 октава = ±12)
+#   bass_gain / treble_gain — усиление/ослабление низких/высоких частот в дБ
+VOICE_STYLE_PRESETS = {
+    "neutral": {"pitch_semitones": 0,  "bass_gain": 0,  "treble_gain": 0},
+    "lower":   {"pitch_semitones": -2, "bass_gain": 3,  "treble_gain": -1},  # ниже и теплее
+    "higher":  {"pitch_semitones": 2,  "bass_gain": -1, "treble_gain": 2},   # выше и чётче
+    "warm":    {"pitch_semitones": -1, "bass_gain": 4,  "treble_gain": -2},  # тёплый, мягкий тембр
+    "bright":  {"pitch_semitones": 1,  "bass_gain": -2, "treble_gain": 4},   # яркий, чёткий тембр
+}
+
+# Пресеты скорости речи — именованные варианты для выпадающего списка,
+# как у emotion/voice_style. XTTS-v2 поддерживает continuous speed
+# нативно (не через ffmpeg), поэтому применяется прямо при синтезе, а не
+# постобработкой. Значение "custom" позволяет задать точное число через
+# отдельный параметр speech_speed_value, если понадобится тонкая настройка
+# сверх трёх стандартных вариантов.
+SPEECH_TEMPO_PRESETS = {
+    "slow":   0.85,
+    "normal": 1.0,
+    "fast":   1.15,
+}
+
+
+def apply_voice_style(audio_path, work_dir, style="neutral"):
+    """Применяет сдвиг высоты тона и лёгкую EQ-обработку через ffmpeg.
+    Сдвиг тона делается классическим трюком asetrate+atempo: меняем
+    частоту дискретизации (что меняет и высоту, и скорость), а потом
+    компенсируем скорость обратно через atempo — в итоге длительность
+    аудио не меняется, меняется только высота тона."""
+    preset = VOICE_STYLE_PRESETS.get(style, VOICE_STYLE_PRESETS["neutral"])
+    pitch_semitones = preset["pitch_semitones"]
+    bass_gain = preset["bass_gain"]
+    treble_gain = preset["treble_gain"]
+
+    if pitch_semitones == 0 and bass_gain == 0 and treble_gain == 0:
+        return audio_path  # neutral — ничего не меняем, экономим шаг
+
+    filters = []
+    if pitch_semitones != 0:
+        factor = 2 ** (pitch_semitones / 12)
+        filters.append(f"asetrate=44100*{factor},aresample=44100,atempo={1/factor}")
+    if bass_gain != 0:
+        filters.append(f"bass=g={bass_gain}")
+    if treble_gain != 0:
+        filters.append(f"treble=g={treble_gain}")
+
+    out_path = f"{work_dir}/voice_styled.wav"
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-af", ",".join(filters),
+        "-ar", "44100",
+        out_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg (voice_style) упал: {proc.stderr[-2000:]}")
+    return out_path
+
+
 EMOTION_PRESETS = {
     "neutral": {"expression_scale": 0.7, "pose_style": 0, "still": True},
     "happy":   {"expression_scale": 1.1, "pose_style": 0, "still": False},
@@ -215,7 +277,35 @@ def handler(event):
                 }
             preset = EMOTION_PRESETS[emotion]
 
-            speech_speed = input_data.get("speech_speed", 1.0)
+            voice_style = input_data.get("voice_style", "neutral")
+            if voice_style not in VOICE_STYLE_PRESETS:
+                return {
+                    "error": (
+                        f"неизвестный voice_style '{voice_style}', "
+                        f"доступны: {list(VOICE_STYLE_PRESETS.keys())}"
+                    )
+                }
+
+            speech_tempo = input_data.get("speech_tempo", "normal")
+            if speech_tempo == "custom":
+                speech_speed = input_data.get("speech_speed_value")
+                if speech_speed is None:
+                    return {
+                        "error": (
+                            "speech_tempo='custom' требует числового "
+                            "speech_speed_value (например 1.05)"
+                        )
+                    }
+            elif speech_tempo in SPEECH_TEMPO_PRESETS:
+                speech_speed = SPEECH_TEMPO_PRESETS[speech_tempo]
+            else:
+                return {
+                    "error": (
+                        f"неизвестный speech_tempo '{speech_tempo}', "
+                        f"доступны: {list(SPEECH_TEMPO_PRESETS.keys()) + ['custom']}"
+                    )
+                }
+
             audio_path = synthesize_speech(
                 text=text,
                 speaker_wav_path=voice_sample_path,
@@ -223,6 +313,7 @@ def handler(event):
                 work_dir=work_dir,
                 speed=speech_speed,
             )
+            audio_path = apply_voice_style(audio_path, work_dir, voice_style)
 
             expression_scale = preset["expression_scale"]
             pose_style = preset["pose_style"]
