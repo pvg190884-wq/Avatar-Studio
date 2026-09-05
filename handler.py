@@ -3,8 +3,10 @@ import base64
 import subprocess
 import os
 import re
+import sys
 import uuid
 import shutil
+from time import strftime
 
 # Ленивая загрузка XTTS-v2: модель НЕ грузится при старте контейнера/импорте
 # модуля (иначе холодный старт воркера может не успеть пройти проверку
@@ -21,6 +23,61 @@ def get_tts_model():
         tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
         print("XTTS-v2 готова.")
     return tts_model
+
+
+# ---------------------------------------------------------------------------
+# SadTalker: резидентная загрузка моделей вместо subprocess на каждый вызов.
+#
+# РАНЬШЕ: run_sadtalker() запускал `python inference.py ...` через
+# subprocess — то есть на КАЖДУЮ генерацию (даже на уже "тёплом" воркере)
+# заново запускался целый Python-процесс, который с нуля грузил на GPU
+# детектор лица, 3DMM-экстрактор и рендер-сеть (CropAndExtract,
+# Audio2Coeff, AnimateFromCoeff из inference.py). Это добавляло от 15
+# секунд до минуты чистого оверхеда на КАЖДУЮ генерацию, никак не влияя
+# на качество результата — просто впустую тратилось время на повторную
+# загрузку одних и тех же весов.
+#
+# ТЕПЕРЬ: те же три объекта создаются один раз (лениво, при первом
+# реальном запросе — как и XTTS выше) и кешируются в памяти процесса
+# воркера. Дальнейшие вызовы на том же воркере переиспользуют уже
+# загруженные модели. Сама логика генерации (шаги пайплайна, параметры)
+# сохранена один в один по оригинальному inference.py из
+# github.com/OpenTalker/SadTalker — качество результата не меняется.
+# ---------------------------------------------------------------------------
+
+SADTALKER_ROOT = "/app/SadTalker"
+sys.path.insert(0, SADTALKER_ROOT)
+
+from src.utils.preprocess import CropAndExtract          # noqa: E402
+from src.test_audio2coeff import Audio2Coeff               # noqa: E402
+from src.facerender.animate import AnimateFromCoeff         # noqa: E402
+from src.generate_batch import get_data                     # noqa: E402
+from src.generate_facerender_batch import get_facerender_data  # noqa: E402
+from src.utils.init_path import init_path                   # noqa: E402
+
+SADTALKER_CHECKPOINT_DIR = f"{SADTALKER_ROOT}/checkpoints"
+SADTALKER_CONFIG_DIR = f"{SADTALKER_ROOT}/src/config"
+
+# Кеш по (size, preprocess) — эти два параметра влияют на то, какие
+# конкретно файлы чекпоинтов подбирает init_path (например, 256 vs 512
+# рендер-модель). old_version у нас всегда False (не прокидывается из
+# handler-инпута), поэтому не включаем его в ключ кеша.
+_sadtalker_models_cache: dict = {}
+
+
+def get_sadtalker_models(size: int, preprocess: str):
+    cache_key = (size, preprocess)
+    if cache_key not in _sadtalker_models_cache:
+        print(f"Загружаю модели SadTalker (size={size}, preprocess={preprocess})...")
+        sadtalker_paths = init_path(
+            SADTALKER_CHECKPOINT_DIR, SADTALKER_CONFIG_DIR, size, False, preprocess
+        )
+        preprocess_model = CropAndExtract(sadtalker_paths, "cuda")
+        audio_to_coeff = Audio2Coeff(sadtalker_paths, "cuda")
+        animate_from_coeff = AnimateFromCoeff(sadtalker_paths, "cuda")
+        _sadtalker_models_cache[cache_key] = (preprocess_model, audio_to_coeff, animate_from_coeff)
+        print("Модели SadTalker готовы и закешированы.")
+    return _sadtalker_models_cache[cache_key]
 
 
 # Параметры генерации XTTS-v2, подобранные под более живую, менее
@@ -53,8 +110,6 @@ def split_into_sentences(text):
     """Разбивает текст на предложения, сохраняя знак препинания в конце
     каждого куска. Нужно для того, чтобы синтезировать TTS по фразам и
     вставлять между ними естественные паузы, а не одним ровным потоком."""
-    # Разбиваем по границе предложения: точка/!/?/многоточие, за которыми
-    # следует пробел и заглавная буква (или конец строки).
     parts = re.split(r'(?<=[.!?…])\s+', text.strip())
     return [p.strip() for p in parts if p.strip()]
 
@@ -187,33 +242,43 @@ FULL_PREPROCESS_DAMPING = 0.65
 
 def run_sadtalker(image_path, audio_path, result_dir, expression_scale,
                    pose_style, size, still, enhancer, preprocess):
-    cmd = [
-        "python", "/app/SadTalker/inference.py",
-        "--driven_audio", audio_path,
-        "--source_image", image_path,
-        "--result_dir", result_dir,
-        "--size", str(size),
-        "--expression_scale", str(expression_scale),
-        "--pose_style", str(pose_style),
-        "--preprocess", preprocess,
-    ]
-    if still:
-        cmd.append("--still")
-    if enhancer:
-        cmd += ["--enhancer", enhancer]
+    """Прямой вызов пайплайна SadTalker внутри процесса воркера — та же
+    последовательность шагов, что в оригинальном inference.py (main()),
+    но с переиспользованием уже загруженных моделей вместо запуска
+    отдельного Python-процесса на каждую генерацию. Структура выходных
+    файлов внутри result_dir сохранена такой же, как раньше (timestamped
+    подпапка + itог.mp4 рядом с ней), поэтому handler() ниже находит
+    результат тем же кодом (os.walk), без изменений."""
+    preprocess_model, audio_to_coeff, animate_from_coeff = get_sadtalker_models(size, preprocess)
 
-    proc = subprocess.run(
-        cmd, cwd="/app/SadTalker",
-        capture_output=True, text=True, timeout=1800
+    save_dir = os.path.join(result_dir, strftime("%Y_%m_%d_%H.%M.%S"))
+    os.makedirs(save_dir, exist_ok=True)
+
+    first_frame_dir = os.path.join(save_dir, "first_frame_dir")
+    os.makedirs(first_frame_dir, exist_ok=True)
+
+    first_coeff_path, crop_pic_path, crop_info = preprocess_model.generate(
+        image_path, first_frame_dir, preprocess, source_image_flag=True, pic_size=size
     )
-    if proc.returncode != 0:
-        raise RuntimeError(f"SadTalker упал: {proc.stderr[-3000:]}")
+    if first_coeff_path is None:
+        raise RuntimeError("SadTalker: не удалось извлечь 3DMM-коэффициенты из фото")
 
-    for root, _, files in os.walk(result_dir):
-        for f in files:
-            if f.endswith(".mp4"):
-                return os.path.join(root, f)
-    raise RuntimeError("SadTalker не создал видео")
+    batch = get_data(first_coeff_path, audio_path, "cuda", None, still=still)
+    coeff_path = audio_to_coeff.generate(batch, save_dir, pose_style, None)
+
+    data = get_facerender_data(
+        coeff_path, crop_pic_path, first_coeff_path, audio_path,
+        batch_size=2, input_yaw_list=None, input_pitch_list=None, input_roll_list=None,
+        expression_scale=expression_scale, still_mode=still, preprocess=preprocess, size=size
+    )
+    result_path = animate_from_coeff.generate(
+        data, save_dir, image_path, crop_info,
+        enhancer=enhancer, background_enhancer=None, preprocess=preprocess, img_size=size
+    )
+
+    final_path = save_dir + ".mp4"
+    shutil.move(result_path, final_path)
+    return final_path
 
 
 def handler(event):
@@ -350,5 +415,3 @@ def handler(event):
 
 
 runpod.serverless.start({"handler": handler})
- 
- 
