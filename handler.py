@@ -297,6 +297,65 @@ def handler(event):
     os.makedirs(work_dir, exist_ok=True)
 
     try:
+        # Режим "только озвучка" — без SadTalker и без фото вообще.
+        # Нужен Кейсу 3 (липсинк по видео + тексту): сначала озвучиваем
+        # текст здесь (переиспользуя уже загруженную XTTS-v2), затем
+        # бэкенд сам отправляет получившееся аудио в отдельный
+        # MuseTalk-воркер вместе с видео пользователя.
+        if input_data.get("tts_only") is True:
+            if "text" not in input_data or "voice_sample_base64" not in input_data:
+                return {"error": "tts_only требует text и voice_sample_base64"}
+
+            voice_sample_path = f"{work_dir}/voice_sample.wav"
+            with open(voice_sample_path, "wb") as f:
+                f.write(base64.b64decode(input_data["voice_sample_base64"]))
+
+            text = input_data["text"]
+            language = input_data.get("language", "ru")
+
+            voice_style = input_data.get("voice_style", "neutral")
+            if voice_style not in VOICE_STYLE_PRESETS:
+                return {
+                    "error": (
+                        f"неизвестный voice_style '{voice_style}', "
+                        f"доступны: {list(VOICE_STYLE_PRESETS.keys())}"
+                    )
+                }
+
+            speech_tempo = input_data.get("speech_tempo", "normal")
+            if speech_tempo == "custom":
+                speech_speed = input_data.get("speech_speed_value")
+                if speech_speed is None:
+                    return {
+                        "error": (
+                            "speech_tempo='custom' требует числового "
+                            "speech_speed_value (например 1.05)"
+                        )
+                    }
+            elif speech_tempo in SPEECH_TEMPO_PRESETS:
+                speech_speed = SPEECH_TEMPO_PRESETS[speech_tempo]
+            else:
+                return {
+                    "error": (
+                        f"неизвестный speech_tempo '{speech_tempo}', "
+                        f"доступны: {list(SPEECH_TEMPO_PRESETS.keys()) + ['custom']}"
+                    )
+                }
+
+            audio_path = synthesize_speech(
+                text=text,
+                speaker_wav_path=voice_sample_path,
+                language=language,
+                work_dir=work_dir,
+                speed=speech_speed,
+            )
+            audio_path = apply_voice_style(audio_path, work_dir, voice_style)
+
+            with open(audio_path, "rb") as af:
+                audio_base64 = base64.b64encode(af.read()).decode("utf-8")
+
+            return {"audio_base64": audio_base64}
+
         if "image_base64" not in input_data:
             return {"error": "нужен image_base64"}
 
