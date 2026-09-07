@@ -130,7 +130,17 @@ def pause_after(sentence):
 def synthesize_speech(text, speaker_wav_path, language, work_dir, speed=1.0):
     """Синтезирует речь по предложениям с естественными паузами между
     ними вместо одного монотонного потока. Возвращает путь к итоговому
-    .wav файлу."""
+    .wav файлу.
+
+    ВАЖНО: соседние куски склеиваются через короткий кроссфейд
+    (CONCAT_CROSSFADE_MS), а не встык (было раньше). Жёсткая склейка
+    двух независимо синтезированных WAV-файлов "внахлёст" почти всегда
+    создаёт щелчок/посторонний звук в точке стыка, если амплитуда
+    сигнала там не в нуле — а поскольку стыки всегда приходятся ровно
+    на границы предложений (то есть рядом со знаками препинания), это
+    воспринимается на слух так, будто модель "странно озвучивает"
+    точки/запятые, хотя причина не в самой TTS-модели, а в способе
+    склейки кусков."""
     from pydub import AudioSegment
 
     model = get_tts_model()
@@ -153,9 +163,15 @@ def synthesize_speech(text, speaker_wav_path, language, work_dir, speed=1.0):
         if i < len(sentences) - 1:
             segments.append(AudioSegment.silent(duration=pause_after(sentence)))
 
+    CONCAT_CROSSFADE_MS = 20
+
     combined = segments[0]
     for seg in segments[1:]:
-        combined += seg
+        fade_ms = min(CONCAT_CROSSFADE_MS, len(combined), len(seg))
+        if fade_ms > 0:
+            combined = combined.append(seg, crossfade=fade_ms)
+        else:
+            combined += seg
 
     final_path = f"{work_dir}/synthesized.wav"
     combined.export(final_path, format="wav")
