@@ -24,3 +24,4 @@ ENV COQUI_TOS_AGREED=1
 RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
 COPY handler.py /app/handler.py
 CMD ["python", "-u", "/app/handler.py"]
+ 
